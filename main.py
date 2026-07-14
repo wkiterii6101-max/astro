@@ -182,7 +182,132 @@ def get_sky_position(hdul):
 
 
 # ------------------------------------------------------------------
-# 5. Streamlit UI
+# 5. 스펙트럼이 없을 때: RGB 값으로 색온도(CCT) 근사 계산
+# ------------------------------------------------------------------
+_RGB_FILTER_NAMES = {
+    "r": {"r", "red", "sdss_r", "rc"},
+    "g": {"g", "green", "sdss_g", "gc"},
+    "b": {"b", "blue", "sdss_b", "bc"},
+}
+
+
+def _match_filter_channel(header):
+    """헤더의 FILTER(또는 BAND) 키워드가 R/G/B 중 어디에 해당하는지 판별."""
+    name = str(header.get("FILTER", header.get("BAND", ""))).strip().lower()
+    for channel, aliases in _RGB_FILTER_NAMES.items():
+        if name in aliases:
+            return channel
+    return None
+
+
+def extract_rgb_planes(hdul):
+    """
+    FITS에서 R/G/B 세 채널(2차원 이미지)을 찾아 dict로 반환.
+    지원하는 형태:
+      A) NAXIS=3 이고 한 축의 크기가 3인 컬러 큐브 (예: (3, H, W) 또는 (H, W, 3))
+      B) FILTER/BAND 헤더가 R/G/B 계열인 2차원 HDU 여러 장
+      C) A/B에 해당하지 않지만 2차원 이미지 HDU가 정확히 3장인 경우
+         (HDU 순서대로 R, G, B로 가정)
+    실패 시 (None, None) 반환.
+    """
+    image_hdus = []
+    for hdu in hdul:
+        try:
+            d = hdu.data
+        except Exception:
+            continue
+        if d is None:
+            continue
+        image_hdus.append((hdu, d))
+
+    # A) 3채널 컬러 큐브
+    for hdu, d in image_hdus:
+        if d.ndim == 3:
+            if d.shape[0] == 3:
+                return {"R": d[0].astype(np.float64),
+                        "G": d[1].astype(np.float64),
+                        "B": d[2].astype(np.float64)}, hdu.header
+            if d.shape[-1] == 3:
+                return {"R": d[..., 0].astype(np.float64),
+                        "G": d[..., 1].astype(np.float64),
+                        "B": d[..., 2].astype(np.float64)}, hdu.header
+
+    two_d = [(hdu, d) for hdu, d in image_hdus if d.ndim == 2]
+
+    # B) FILTER 헤더로 R/G/B 판별
+    channels = {}
+    header_ref = None
+    for hdu, d in two_d:
+        ch = _match_filter_channel(hdu.header)
+        if ch and ch.upper() not in channels:
+            channels[ch.upper()] = d.astype(np.float64)
+            header_ref = hdu.header
+    if {"R", "G", "B"} <= channels.keys():
+        return channels, header_ref
+
+    # C) 필터 정보 없이 2차원 이미지가 정확히 3장인 경우, 순서대로 R,G,B로 가정
+    if len(two_d) == 3:
+        (h1, d1), (h2, d2), (h3, d3) = two_d
+        return {"R": d1.astype(np.float64),
+                "G": d2.astype(np.float64),
+                "B": d3.astype(np.float64)}, h1.header
+
+    return None, None
+
+
+def sample_rgb_at_brightest(rgb_planes):
+    """
+    R+G+B 합성 밝기가 가장 큰 픽셀 위치에서 각 채널 값을 뽑아
+    (그 채널의 최댓값 대비) 0~1 사이로 정규화해서 반환.
+    """
+    r, g, b = rgb_planes["R"], rgb_planes["G"], rgb_planes["B"]
+    luminance = np.nan_to_num(r) + np.nan_to_num(g) + np.nan_to_num(b)
+    y_max, x_max = np.unravel_index(np.nanargmax(luminance), luminance.shape)
+
+    def norm(channel):
+        m = np.nanmax(channel)
+        return float(channel[y_max, x_max] / m) if m > 0 else 0.0
+
+    r_n, g_n, b_n = norm(r), norm(g), norm(b)
+    return r_n, g_n, b_n, (x_max, y_max)
+
+
+def rgb_to_cct(r, g, b):
+    """
+    정규화된 RGB(0~1)를 McCamy의 근사식을 이용해 상관색온도(CCT, Kelvin)로 변환.
+    1) sRGB(D65) -> XYZ 선형 변환
+    2) XYZ -> xy 색도좌표
+    3) McCamy 공식으로 CCT 근사
+    (실제 항성 스펙트럼 기반 온도보다 훨씬 거친 근사치입니다.)
+    """
+    m = max(r, g, b)
+    if m <= 0:
+        return None
+    r, g, b = r / m, g / m, b / m  # 상대 밝기로 정규화
+
+    # sRGB(D65) 선형 -> CIE XYZ
+    X = 0.4124 * r + 0.3576 * g + 0.1805 * b
+    Y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    Z = 0.0193 * r + 0.1192 * g + 0.9505 * b
+
+    denom = X + Y + Z
+    if denom <= 0:
+        return None
+    x = X / denom
+    y = Y / denom
+
+    if (0.1858 - y) == 0:
+        return None
+    n = (x - 0.3320) / (0.1858 - y)
+    cct = 449 * n ** 3 + 3525 * n ** 2 + 6823.3 * n + 5520.33
+
+    if not np.isfinite(cct) or cct <= 0:
+        return None
+    return float(cct)
+
+
+# ------------------------------------------------------------------
+# 6. Streamlit UI
 # ------------------------------------------------------------------
 def main():
     st.set_page_config(page_title="천체 위치·온도 분석", layout="wide")
