@@ -67,7 +67,6 @@ def extract_spectrum(hdul):
     FITS HDU 리스트에서 1차원 스펙트럼 데이터를 찾아 (wavelength[m], flux) 반환.
     - 1차원 데이터 + WCS(CRVAL1/CDELT1/CRPIX1)로 파장축을 만드는 경우를 우선 처리.
     - 파장 단위 헤더(CUNIT1)가 있으면 nm/Angstrom -> m 변환.
-    - .fits.fz(CompImageHDU) 압축 확장도 자동으로 압축 해제하여 처리.
     """
     data = None
     header = None
@@ -131,6 +130,11 @@ def fit_temperature(wavelength_m, flux):
     flux_norm = flux / np.max(flux)
 
     T0 = wien_peak_temperature(wavelength_m, flux)
+    # curve_fit의 bounds(500~50000K)를 벗어나면 ValueError가 발생하므로
+    # 초기값을 반드시 이 범위 안으로 제한(clamp)한다.
+    T0 = float(np.clip(T0, 500.0, 50000.0))
+    if not np.isfinite(T0):
+        T0 = 5778.0  # 계산 실패 시 태양 온도로 대체
 
     def model(wl, T, scale):
         planck = planck_lambda(wl, T)
@@ -154,7 +158,6 @@ def get_sky_position(hdul):
     """
     2차원 이미지 HDU에서 WCS 정보를 읽어 천체(가장 밝은 픽셀 또는 이미지 중심)의
     적경(RA), 적위(Dec)를 계산.
-    - .fits.fz(CompImageHDU) 압축 확장도 자동으로 압축 해제하여 처리.
     """
     for hdu in hdul:
         try:
@@ -166,14 +169,14 @@ def get_sky_position(hdul):
             header = hdu.header
             try:
                 w = WCS(header)
+                # 가장 밝은 픽셀(천체로 추정)을 대상 좌표로 사용
+                y_max, x_max = np.unravel_index(np.nanargmax(data), data.shape)
+                ra, dec = w.wcs_pix2world(x_max, y_max, 0)
+                sky_coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
             except Exception:
-                continue  # 이 HDU에 유효한 WCS가 없으면 다음 HDU 확인
-
-            # 가장 밝은 픽셀(천체로 추정)을 대상 좌표로 사용
-            y_max, x_max = np.unravel_index(np.nanargmax(data), data.shape)
-            ra, dec = w.wcs_pix2world(x_max, y_max, 0)
-
-            sky_coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+                # 유효한 WCS가 없거나(All-NaN 데이터 등) 좌표 계산에 실패하면
+                # 다음 HDU를 계속 확인
+                continue
             return sky_coord, (x_max, y_max), data
     return None, None, None
 
@@ -218,7 +221,12 @@ def main():
     # ---------------- 위치(WCS) ----------------
     with col1:
         st.subheader("📍 천체 위치 (WCS)")
-        sky_coord, pixel_pos, image_data = get_sky_position(hdul)
+        try:
+            sky_coord, pixel_pos, image_data = get_sky_position(hdul)
+        except Exception as e:
+            st.error("위치 계산 중 오류가 발생했습니다. 아래 상세 내용을 확인해주세요.")
+            st.exception(e)
+            sky_coord, pixel_pos, image_data = None, None, None
         if sky_coord is not None:
             st.write(f"**RA (적경):** {sky_coord.ra.to_string(unit=u.hourangle, sep=':')} "
                      f"({sky_coord.ra.deg:.6f}°)")
@@ -240,7 +248,12 @@ def main():
     # ---------------- 온도(스펙트럼) ----------------
     with col2:
         st.subheader("🌡️ 온도 (흑체복사 스펙트럼 피팅)")
-        wavelength_m, flux, spec_header = extract_spectrum(hdul)
+        try:
+            wavelength_m, flux, spec_header = extract_spectrum(hdul)
+        except Exception as e:
+            st.error("스펙트럼 추출 중 오류가 발생했습니다. 아래 상세 내용을 확인해주세요.")
+            st.exception(e)
+            wavelength_m, flux = None, None
         if wavelength_m is not None:
             try:
                 T_fit, T_err, model, wl_used, flux_norm = fit_temperature(wavelength_m, flux)
@@ -261,14 +274,22 @@ def main():
                 ax2.set_title("Spectrum & Blackbody Fit")
                 st.pyplot(fig2)
             except Exception as e:
-                st.error(f"온도 피팅에 실패했습니다: {e}")
+                st.error("온도 피팅에 실패했습니다. 아래 상세 내용을 확인해주세요.")
+                st.exception(e)
         else:
             st.warning("1차원 스펙트럼(flux-wavelength) 데이터를 찾지 못했습니다.")
 
     with st.expander("FITS 헤더 보기"):
         # .fits.fz 압축 파일은 0번(Primary) HDU가 비어있고 실제 데이터/헤더는
         # 뒤쪽 HDU(예: CompImageHDU)에 있는 경우가 많아, 데이터가 있는 첫 HDU를 표시
-        header_hdu = next((h for h in hdul if h.data is not None), hdul[0])
+        header_hdu = hdul[0]
+        for h in hdul:
+            try:
+                if h.data is not None:
+                    header_hdu = h
+                    break
+            except Exception:
+                continue
         st.text(repr(header_hdu.header))
 
 
