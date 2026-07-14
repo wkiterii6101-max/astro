@@ -11,58 +11,22 @@
 """
 
 import io
-import os
-import urllib.request
 
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.font_manager as fm
 import streamlit as st
+
+# 그래프(matplotlib)에는 한글 폰트가 없는 환경(예: Streamlit Cloud)에서도
+# 글자가 깨지지 않도록 축/제목/범례 텍스트를 전부 영어로 표기합니다.
+# (Streamlit UI 쪽 한글 텍스트는 브라우저가 렌더링하므로 문제 없습니다.)
+plt.rcParams["axes.unicode_minus"] = False
+
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from scipy.optimize import curve_fit
 from scipy.constants import h, c, k as k_B
-
-
-# ------------------------------------------------------------------
-# 0. matplotlib 한글 폰트 설정
-#    (한글 시스템 폰트가 없는 환경, 예: Streamlit Cloud에서도 동작하도록
-#     나눔고딕 폰트를 직접 다운로드하여 등록합니다.)
-# ------------------------------------------------------------------
-@st.cache_resource
-def set_korean_font():
-    # 1) 시스템에 이미 설치된 한글 폰트가 있는지 확인
-    #    (packages.txt로 fonts-nanum을 설치했다면 여기서 잡힘)
-    korean_candidates = ["NanumGothic", "Malgun Gothic", "AppleGothic", "Noto Sans CJK KR"]
-    installed = {f.name for f in fm.fontManager.ttflist}
-    for name in korean_candidates:
-        if name in installed:
-            plt.rcParams["font.family"] = name
-            plt.rcParams["axes.unicode_minus"] = False
-            return
-
-    # 2) 없으면 나눔고딕 폰트를 직접 다운로드하여 등록 (인터넷 연결 필요)
-    font_path = os.path.join(os.path.dirname(__file__), "NanumGothic.ttf")
-    if not os.path.exists(font_path):
-        url = (
-            "https://raw.githubusercontent.com/naver/nanumfont/master/"
-            "fonts/NanumGothic.ttf"
-        )
-        try:
-            urllib.request.urlretrieve(url, font_path)
-        except Exception:
-            return  # 다운로드 실패 시 기본 폰트로 진행 (그래프 한글이 깨질 수 있음)
-
-    if os.path.exists(font_path):
-        fm.fontManager.addfont(font_path)
-        plt.rcParams["font.family"] = fm.FontProperties(fname=font_path).get_name()
-
-    plt.rcParams["axes.unicode_minus"] = False
-
-
-set_korean_font()
 
 
 # ------------------------------------------------------------------
@@ -248,7 +212,9 @@ def main():
             ax.imshow(image_data, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
             ax.scatter(pixel_pos[0], pixel_pos[1], s=120, facecolors="none",
                        edgecolors="red", linewidths=2)
-            ax.set_title("탐지된 천체 위치 (빨간 원)")
+            ax.set_title("Detected Object Position (red circle)")
+            ax.set_xlabel("X (pixel)")
+            ax.set_ylabel("Y (pixel)")
             st.pyplot(fig)
         else:
             st.warning("이미지(2D) 데이터 또는 WCS 정보를 찾지 못했습니다.")
@@ -265,16 +231,16 @@ def main():
 
                 fig2, ax2 = plt.subplots()
                 wl_nm = wl_used * 1e9  # nm 단위로 표시
-                ax2.plot(wl_nm, flux_norm, "o", ms=3, alpha=0.6, label="관측 스펙트럼")
+                ax2.plot(wl_nm, flux_norm, "o", ms=3, alpha=0.6, label="Observed spectrum")
 
                 wl_smooth = np.linspace(wl_used.min(), wl_used.max(), 500)
                 ax2.plot(wl_smooth * 1e9, model(wl_smooth, T_fit, 1.0), "-", lw=2,
-                         label=f"흑체 피팅 (T={T_fit:,.0f} K)")
+                         label=f"Blackbody fit (T={T_fit:,.0f} K)")
 
-                ax2.set_xlabel("파장 (nm)")
-                ax2.set_ylabel("정규화된 flux")
+                ax2.set_xlabel("Wavelength (nm)")
+                ax2.set_ylabel("Normalized flux")
                 ax2.legend()
-                ax2.set_title("스펙트럼 & 흑체복사 피팅")
+                ax2.set_title("Spectrum & Blackbody Fit")
                 st.pyplot(fig2)
             except Exception as e:
                 st.error(f"온도 피팅에 실패했습니다: {e}")
