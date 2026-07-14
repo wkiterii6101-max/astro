@@ -67,12 +67,18 @@ def extract_spectrum(hdul):
     FITS HDU 리스트에서 1차원 스펙트럼 데이터를 찾아 (wavelength[m], flux) 반환.
     - 1차원 데이터 + WCS(CRVAL1/CDELT1/CRPIX1)로 파장축을 만드는 경우를 우선 처리.
     - 파장 단위 헤더(CUNIT1)가 있으면 nm/Angstrom -> m 변환.
+    - .fits.fz(CompImageHDU) 압축 확장도 자동으로 압축 해제하여 처리.
     """
     data = None
     header = None
     for hdu in hdul:
-        if hdu.data is not None and hdu.data.ndim == 1:
-            data = hdu.data.astype(np.float64)
+        try:
+            hdu_data = hdu.data  # .fits.fz(CompImageHDU)는 여기서 압축 해제가 일어남
+        except Exception:
+            # 해당 확장(HDU)의 압축 해제에 실패하면 건너뛰고 다음 HDU를 확인
+            continue
+        if hdu_data is not None and hdu_data.ndim == 1:
+            data = hdu_data.astype(np.float64)
             header = hdu.header
             break
 
@@ -148,15 +154,20 @@ def get_sky_position(hdul):
     """
     2차원 이미지 HDU에서 WCS 정보를 읽어 천체(가장 밝은 픽셀 또는 이미지 중심)의
     적경(RA), 적위(Dec)를 계산.
+    - .fits.fz(CompImageHDU) 압축 확장도 자동으로 압축 해제하여 처리.
     """
     for hdu in hdul:
-        if hdu.data is not None and hdu.data.ndim == 2:
-            data = hdu.data
+        try:
+            hdu_data = hdu.data  # .fits.fz(CompImageHDU)는 여기서 압축 해제가 일어남
+        except Exception:
+            continue
+        if hdu_data is not None and hdu_data.ndim == 2:
+            data = hdu_data
             header = hdu.header
             try:
                 w = WCS(header)
             except Exception:
-                return None, None, None
+                continue  # 이 HDU에 유효한 WCS가 없으면 다음 HDU 확인
 
             # 가장 밝은 픽셀(천체로 추정)을 대상 좌표로 사용
             y_max, x_max = np.unravel_index(np.nanargmax(data), data.shape)
@@ -182,7 +193,10 @@ def main():
         """
     )
 
-    uploaded_file = st.file_uploader("FITS 파일 업로드 (.fits, .fit)", type=["fits", "fit"])
+    uploaded_file = st.file_uploader(
+        "FITS 파일 업로드 (.fits, .fit, .fits.fz)",
+        type=["fits", "fit", "fz"],
+    )
 
     if uploaded_file is None:
         st.info("분석할 FITS 파일을 업로드해주세요.")
@@ -192,7 +206,11 @@ def main():
         file_bytes = uploaded_file.read()
         hdul = fits.open(io.BytesIO(file_bytes))
     except Exception as e:
-        st.error(f"FITS 파일을 여는 데 실패했습니다: {e}")
+        st.error(
+            f"FITS 파일을 여는 데 실패했습니다: {e}\n\n"
+            "※ .fits.fz 파일인데 실패한다면, RICE/GZIP 이외의 특수 압축(예: HCOMPRESS)이거나 "
+            "파일이 손상되었을 수 있습니다."
+        )
         return
 
     col1, col2 = st.columns(2)
@@ -248,7 +266,10 @@ def main():
             st.warning("1차원 스펙트럼(flux-wavelength) 데이터를 찾지 못했습니다.")
 
     with st.expander("FITS 헤더 보기"):
-        st.text(repr(hdul[0].header))
+        # .fits.fz 압축 파일은 0번(Primary) HDU가 비어있고 실제 데이터/헤더는
+        # 뒤쪽 HDU(예: CompImageHDU)에 있는 경우가 많아, 데이터가 있는 첫 HDU를 표시
+        header_hdu = next((h for h in hdul if h.data is not None), hdul[0])
+        st.text(repr(header_hdu.header))
 
 
 if __name__ == "__main__":
