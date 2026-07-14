@@ -1,216 +1,253 @@
-import streamlit as st
+"""
+FITS WCS 천체 위치 계산기
+--------------------------------
+FITS 이미지를 업로드하면 헤더의 WCS(World Coordinate System) 정보를 이용해
+픽셀 좌표 <-> 하늘 좌표(RA/Dec)를 상호 변환해주는 Streamlit 앱입니다.
+
+실행:
+    streamlit run streamlit_app.py
+
+필요 패키지는 requirements.txt 참고
+"""
+
+import io
 
 import numpy as np
-
+import matplotlib.pyplot as plt
+import streamlit as st
 from astropy.io import fits
+from astropy.wcs import WCS, FITSFixedWarning
+from astropy.coordinates import SkyCoord
+from astropy import units as u
+from astropy.visualization import ZScaleInterval, ImageNormalize
+import warnings
 
-from PIL import Image
+# streamlit-image-coordinates: 이미지를 클릭해서 픽셀 좌표를 얻기 위한 컴포넌트
+try:
+    from streamlit_image_coordinates import streamlit_image_coordinates
+    HAS_CLICK = True
+except ImportError:
+    HAS_CLICK = False
 
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+warnings.simplefilter("ignore", category=FITSFixedWarning)
 
-from astropy.time import Time
+st.set_page_config(page_title="FITS WCS 천체 위치 계산기", layout="wide")
 
-from datetime import datetime
-
-
-# --- Streamlit 앱 페이지 설정 ---
-
-st.set_page_config(page_title="천문 이미지 분석기", layout="wide")
-
-st.title("🔭 천문 이미지 처리 앱")
+st.title("🔭 FITS WCS 천체 위치 계산기")
+st.caption("FITS 이미지를 업로드하면 WCS 정보를 이용해 픽셀 좌표를 RA/Dec로 변환합니다.")
 
 
-# --- 파일 업로더 ---
+# ---------------------------------------------------------------------------
+# 유틸 함수
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_fits(file_bytes: bytes):
+    """업로드된 바이트에서 FITS를 읽어 (data, header, hdu 인덱스) 반환"""
+    hdul = fits.open(io.BytesIO(file_bytes))
+    # 이미지 데이터가 들어있는 첫 HDU 탐색 (data가 None이 아닌 것)
+    idx = 0
+    for i, hdu in enumerate(hdul):
+        if hdu.data is not None:
+            idx = i
+            break
+    data = hdul[idx].data
+    header = hdul[idx].header
+    hdul.close()
+    return data, header, idx
+
+
+def get_wcs(header):
+    try:
+        w = WCS(header)
+        if w.has_celestial:
+            return w
+        return None
+    except Exception as e:
+        st.error(f"WCS 파싱 실패: {e}")
+        return None
+
+
+def make_display_image(data: np.ndarray):
+    """2D 이미지 데이터를 ZScale로 정규화하여 matplotlib figure 생성"""
+    # 다차원(예: 3D 큐브)일 경우 첫 프레임만 사용
+    arr = np.array(data, dtype=float)
+    while arr.ndim > 2:
+        arr = arr[0]
+
+    norm = ImageNormalize(arr, interval=ZScaleInterval())
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.imshow(arr, origin="lower", cmap="gray", norm=norm)
+    ax.set_xlabel("X (pixel)")
+    ax.set_ylabel("Y (pixel)")
+    fig.tight_layout()
+    return fig, arr
+
+
+def pixel_to_radec(w: WCS, x: float, y: float):
+    sky = w.pixel_to_world(x, y)
+    if isinstance(sky, SkyCoord):
+        return sky
+    # 일부 WCS(3D 등)는 리스트를 반환할 수 있음
+    return sky[0]
+
+
+def radec_to_pixel(w: WCS, ra_deg: float, dec_deg: float):
+    sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+    x, y = w.world_to_pixel(sky)
+    return float(x), float(y)
+
+
+# ---------------------------------------------------------------------------
+# 메인 UI
+# ---------------------------------------------------------------------------
 
 uploaded_file = st.file_uploader(
-
-    "분석할 FITS 파일을 선택하세요.",
-
-    type=['fits', 'fit', 'fz']
-
+    "FITS 파일 업로드 (.fits, .fit, .fts)",
+    type=["fits", "fit", "fts"],
 )
 
+if uploaded_file is None:
+    st.info("좌측 상단에서 FITS 파일을 업로드해 주세요.")
+    st.stop()
 
-# --- 서울 위치 설정 (고정값) ---
+file_bytes = uploaded_file.read()
 
-seoul_location = EarthLocation(lat=37.5665, lon=126.9780, height=50)  # 서울 위도/경도/고도
-
-
-# --- 현재 시간 (UTC 기준) ---
-
-now = datetime.utcnow()
-
-now_astropy = Time(now)
-
-
-# --- 파일이 업로드되면 실행될 로직 ---
-
-if uploaded_file:
-
+with st.spinner("FITS 파일을 읽는 중..."):
     try:
-
-        with fits.open(uploaded_file) as hdul:
-
-            image_hdu = None
-
-            for hdu in hdul:
-
-                if hdu.data is not None and hdu.is_image:
-
-                    image_hdu = hdu
-
-                    break
-
-
-            if image_hdu is None:
-
-                st.error("파일에서 유효한 이미지 데이터를 찾을 수 없습니다.")
-
-            else:
-
-                header = image_hdu.header
-
-                data = image_hdu.data
-
-                data = np.nan_to_num(data)
-
-
-                st.success(f"**'{uploaded_file.name}'** 파일을 성공적으로 처리했습니다.")
-
-                col1, col2 = st.columns(2)
-
-
-                with col1:
-
-                    st.header("이미지 정보")
-
-                    st.text(f"크기: {data.shape[1]} x {data.shape[0]} 픽셀")
-
-                    if 'OBJECT' in header:
-
-                        st.text(f"관측 대상: {header['OBJECT']}")
-
-                    if 'EXPTIME' in header:
-
-                        st.text(f"노출 시간: {header['EXPTIME']} 초")
-
-
-                    st.header("물리량")
-
-                    mean_brightness = np.mean(data)
-
-                    st.metric(label="이미지 전체 평균 밝기", value=f"{mean_brightness:.2f}")
-
-
-                with col2:
-
-                    st.header("이미지 미리보기")
-
-                    if data.max() == data.min():
-
-                        norm_data = np.zeros(data.shape, dtype=np.uint8)
-
-                    else:
-
-                        scale_min = np.percentile(data, 5)
-
-                        scale_max = np.percentile(data, 99.5)
-
-                        data_clipped = np.clip(data, scale_min, scale_max)
-
-                        norm_data = (255 * (data_clipped - scale_min) / (scale_max - scale_min)).astype(np.uint8)
-
-
-                    img = Image.fromarray(norm_data)
-
-                    st.image(img, caption="업로드된 FITS 이미지", use_container_width=True)
-
-
-
-                # --- 사이드바: 현재 천체 위치 계산 ---
-
-                st.sidebar.header("🧭 현재 천체 위치 (서울 기준)")
-
-
-                if 'RA' in header and 'DEC' in header:
-
-                    try:
-
-                        target_coord = SkyCoord(ra=header['RA'], dec=header['DEC'], unit=('hourangle', 'deg'))
-
-                        altaz = target_coord.transform_to(AltAz(obstime=now_astropy, location=seoul_location))
-
-                        altitude = altaz.alt.degree
-
-                        azimuth = altaz.az.degree
-
-
-                        st.sidebar.metric("고도 (°)", f"{altitude:.2f}")
-
-                        st.sidebar.metric("방위각 (°)", f"{azimuth:.2f}")
-
-                    except Exception as e:
-
-                        st.sidebar.warning(f"천체 위치 계산 실패: {e}")
-
-                else:
-
-                    st.sidebar.info("FITS 헤더에 RA/DEC 정보가 없습니다.")
-
-
+        data, header, hdu_idx = load_fits(file_bytes)
     except Exception as e:
+        st.error(f"FITS 파일을 읽을 수 없습니다: {e}")
+        st.stop()
 
-        st.error(f"파일 처리 중 오류가 발생했습니다: {e}")
+if data is None:
+    st.error("이미지 데이터를 찾을 수 없습니다. (선택된 HDU에 데이터 없음)")
+    st.stop()
 
-        st.warning("파일이 손상되었거나 유효한 FITS 형식이 아닐 수 있습니다.")
+w = get_wcs(header)
 
-else:
+col_img, col_info = st.columns([2, 1])
 
-    st.info("시작하려면 FITS 파일을 업로드해주세요.")
+with col_info:
+    st.subheader("📋 헤더 / WCS 정보")
+    st.write(f"**사용된 HDU 인덱스:** {hdu_idx}")
+    st.write(f"**이미지 크기 (shape):** {data.shape}")
 
+    if w is None:
+        st.warning("이 FITS 헤더에는 유효한 천체 좌표계(WCS) 정보가 없습니다. "
+                   "CRVAL/CRPIX/CDELT/CTYPE 등의 키워드를 확인해 주세요.")
+    else:
+        st.success("WCS 정보를 정상적으로 읽었습니다.")
+        wcs_keys = ["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2",
+                    "CRPIX1", "CRPIX2", "CDELT1", "CDELT2", "CD1_1", "CD2_2"]
+        found = {k: header[k] for k in wcs_keys if k in header}
+        if found:
+            st.json(found)
 
-# --- 💬 댓글 기능 (세션 기반) ---
+    with st.expander("전체 FITS 헤더 보기"):
+        st.text(repr(header))
+
+with col_img:
+    st.subheader("🖼️ 이미지")
+    fig, arr = make_display_image(data)
+
+    if w is not None and HAS_CLICK:
+        st.caption("이미지를 클릭하면 해당 픽셀의 RA/Dec를 계산합니다.")
+        # matplotlib figure -> PNG로 변환 후 클릭 좌표 컴포넌트에 표시
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=150)
+        buf.seek(0)
+        from PIL import Image
+        pil_img = Image.open(buf)
+
+        coords = streamlit_image_coordinates(pil_img, key="fits_click")
+        plt.close(fig)
+
+        if coords is not None:
+            # 화면상 픽셀 좌표를 원본 이미지 픽셀 좌표로 환산
+            disp_w, disp_h = pil_img.size
+            data_h, data_w = arr.shape
+            click_x_disp, click_y_disp = coords["x"], coords["y"]
+
+            # matplotlib figure의 여백을 고려하기보다는 근사 비율 변환 사용
+            px = click_x_disp / disp_w * data_w
+            # imshow origin='lower' 이므로 화면 y(위->아래)를 데이터 y(아래->위)로 반전
+            py = data_h - (click_y_disp / disp_h * data_h)
+
+            st.session_state["pick_x"] = px
+            st.session_state["pick_y"] = py
+    else:
+        st.pyplot(fig)
+        plt.close(fig)
+        if w is not None and not HAS_CLICK:
+            st.caption(
+                "💡 이미지를 클릭해서 좌표를 얻으려면 "
+                "`pip install streamlit-image-coordinates` 를 설치하세요. "
+                "지금은 아래에서 픽셀 좌표를 직접 입력해 주세요."
+            )
+
+# ---------------------------------------------------------------------------
+# 좌표 변환 UI
+# ---------------------------------------------------------------------------
+
+if w is not None:
+    st.divider()
+    st.subheader("📐 좌표 변환")
+
+    tab_pix2sky, tab_sky2pix = st.tabs(["픽셀 → 하늘좌표 (RA/Dec)", "하늘좌표 → 픽셀"])
+
+    ny, nx = arr.shape
+
+    with tab_pix2sky:
+        c1, c2, c3 = st.columns([1, 1, 1])
+        default_x = st.session_state.get("pick_x", nx / 2)
+        default_y = st.session_state.get("pick_y", ny / 2)
+
+        x_pix = c1.number_input("X (pixel)", value=float(default_x), format="%.3f")
+        y_pix = c2.number_input("Y (pixel)", value=float(default_y), format="%.3f")
+
+        if c3.button("계산하기", type="primary", key="btn_pix2sky"):
+            try:
+                sky = pixel_to_radec(w, x_pix, y_pix)
+                ra_deg = sky.ra.deg
+                dec_deg = sky.dec.deg
+
+                r1, r2 = st.columns(2)
+                with r1:
+                    st.metric("RA (deg)", f"{ra_deg:.6f}")
+                    st.metric("RA (hms)", sky.ra.to_string(unit=u.hourangle, sep=":", precision=2))
+                with r2:
+                    st.metric("Dec (deg)", f"{dec_deg:.6f}")
+                    st.metric("Dec (dms)", sky.dec.to_string(unit=u.deg, sep=":", precision=2))
+
+                st.code(
+                    f"RA  = {ra_deg:.6f} deg  ({sky.ra.to_string(unit=u.hourangle, sep=':', precision=2)})\n"
+                    f"Dec = {dec_deg:.6f} deg ({sky.dec.to_string(unit=u.deg, sep=':', precision=2)})",
+                    language="text",
+                )
+            except Exception as e:
+                st.error(f"좌표 변환 중 오류가 발생했습니다: {e}")
+
+    with tab_sky2pix:
+        c1, c2, c3 = st.columns([1, 1, 1])
+        ra_in = c1.number_input("RA (deg)", value=0.0, format="%.6f")
+        dec_in = c2.number_input("Dec (deg)", value=0.0, format="%.6f")
+
+        if c3.button("계산하기", type="primary", key="btn_sky2pix"):
+            try:
+                x_out, y_out = radec_to_pixel(w, ra_in, dec_in)
+                r1, r2 = st.columns(2)
+                r1.metric("X (pixel)", f"{x_out:.3f}")
+                r2.metric("Y (pixel)", f"{y_out:.3f}")
+
+                in_bounds = (0 <= x_out < nx) and (0 <= y_out < ny)
+                if not in_bounds:
+                    st.warning("계산된 픽셀 좌표가 이미지 범위를 벗어났습니다 (이미지 밖의 천체일 수 있습니다).")
+            except Exception as e:
+                st.error(f"좌표 변환 중 오류가 발생했습니다: {e}")
 
 st.divider()
-
-st.header("💬 의견 남기기")
-
-
-if "comments" not in st.session_state:
-
-    st.session_state.comments = []
-
-
-with st.form(key="comment_form"):
-
-    name = st.text_input("이름을 입력하세요", key="name_input")
-
-    comment = st.text_area("댓글을 입력하세요", key="comment_input")
-
-    submitted = st.form_submit_button("댓글 남기기")
-
-
-    if submitted:
-
-        if name.strip() and comment.strip():
-
-            st.session_state.comments.append((name.strip(), comment.strip()))
-
-            st.success("댓글이 저장되었습니다.")
-
-        else:
-
-            st.warning("이름과 댓글을 모두 입력해주세요.")
-
-
-if st.session_state.comments:
-
-    st.subheader("📋 전체 댓글")
-
-    for i, (n, c) in enumerate(reversed(st.session_state.comments), 1):
-
-        st.markdown(f"**{i}. {n}**: {c}")
-
-else:
-
-    st.info("아직 댓글이 없습니다. 첫 댓글을 남겨보세요!")
+st.caption(
+    "Made with Astropy WCS + Streamlit. "
+    "이미지 좌상단/좌하단 원점 규약은 FITS 표준(origin=0, 좌하단)을 따릅니다."
+)
