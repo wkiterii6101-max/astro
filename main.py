@@ -11,9 +11,12 @@
 """
 
 import io
+import os
+import urllib.request
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 import streamlit as st
 from astropy.io import fits
 from astropy.wcs import WCS
@@ -21,6 +24,45 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from scipy.optimize import curve_fit
 from scipy.constants import h, c, k as k_B
+
+
+# ------------------------------------------------------------------
+# 0. matplotlib 한글 폰트 설정
+#    (한글 시스템 폰트가 없는 환경, 예: Streamlit Cloud에서도 동작하도록
+#     나눔고딕 폰트를 직접 다운로드하여 등록합니다.)
+# ------------------------------------------------------------------
+@st.cache_resource
+def set_korean_font():
+    # 1) 시스템에 이미 설치된 한글 폰트가 있는지 확인
+    #    (packages.txt로 fonts-nanum을 설치했다면 여기서 잡힘)
+    korean_candidates = ["NanumGothic", "Malgun Gothic", "AppleGothic", "Noto Sans CJK KR"]
+    installed = {f.name for f in fm.fontManager.ttflist}
+    for name in korean_candidates:
+        if name in installed:
+            plt.rcParams["font.family"] = name
+            plt.rcParams["axes.unicode_minus"] = False
+            return
+
+    # 2) 없으면 나눔고딕 폰트를 직접 다운로드하여 등록 (인터넷 연결 필요)
+    font_path = os.path.join(os.path.dirname(__file__), "NanumGothic.ttf")
+    if not os.path.exists(font_path):
+        url = (
+            "https://raw.githubusercontent.com/naver/nanumfont/master/"
+            "fonts/NanumGothic.ttf"
+        )
+        try:
+            urllib.request.urlretrieve(url, font_path)
+        except Exception:
+            return  # 다운로드 실패 시 기본 폰트로 진행 (그래프 한글이 깨질 수 있음)
+
+    if os.path.exists(font_path):
+        fm.fontManager.addfont(font_path)
+        plt.rcParams["font.family"] = fm.FontProperties(fname=font_path).get_name()
+
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+set_korean_font()
 
 
 # ------------------------------------------------------------------
