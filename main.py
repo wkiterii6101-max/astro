@@ -1,13 +1,13 @@
 """
-FITS WCS 천체 위치 계산기
---------------------------------
-FITS 이미지를 업로드하면 헤더의 WCS(World Coordinate System) 정보를 이용해
-픽셀 좌표 <-> 하늘 좌표(RA/Dec)를 상호 변환해주는 Streamlit 앱입니다.
+천체 FITS 분석 앱
+------------------------------------------------
+- 업로드한 FITS 파일에서 스펙트럼(1차원 flux-wavelength 데이터)을 추출하여
+  흑체복사(Planck 함수) 피팅으로 표면 온도를 계산합니다.
+- FITS 헤더의 WCS 정보를 이용해 천체의 하늘 좌표(RA, Dec)를 계산합니다.
+- Streamlit UI로 결과(스펙트럼 그래프, 온도, 좌표, 이미지+마커)를 시각화합니다.
 
-실행:
-    streamlit run streamlit_app.py
-
-필요 패키지는 requirements.txt 참고
+실행: streamlit run app.py
+필요 패키지: streamlit, astropy, numpy, scipy, matplotlib
 """
 
 import io
@@ -16,238 +16,232 @@ import numpy as np
 import matplotlib.pyplot as plt
 import streamlit as st
 from astropy.io import fits
-from astropy.wcs import WCS, FITSFixedWarning
+from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
-from astropy import units as u
-from astropy.visualization import ZScaleInterval, ImageNormalize
-import warnings
-
-# streamlit-image-coordinates: 이미지를 클릭해서 픽셀 좌표를 얻기 위한 컴포넌트
-try:
-    from streamlit_image_coordinates import streamlit_image_coordinates
-    HAS_CLICK = True
-except ImportError:
-    HAS_CLICK = False
-
-warnings.simplefilter("ignore", category=FITSFixedWarning)
-
-st.set_page_config(page_title="FITS WCS 천체 위치 계산기", layout="wide")
-
-st.title("🔭 FITS WCS 천체 위치 계산기")
-st.caption("FITS 이미지를 업로드하면 WCS 정보를 이용해 픽셀 좌표를 RA/Dec로 변환합니다.")
+import astropy.units as u
+from scipy.optimize import curve_fit
+from scipy.constants import h, c, k as k_B
 
 
-# ---------------------------------------------------------------------------
-# 유틸 함수
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 1. 물리 상수 & 흑체복사(Planck) 함수
+# ------------------------------------------------------------------
+def planck_lambda(wavelength_m, T):
+    """
+    흑체복사 스펙트럼 세기 (단위 파장당 복사휘도).
+    wavelength_m : 파장 [m] 단위의 배열
+    T            : 온도 [K]
+    """
+    wavelength_m = np.asarray(wavelength_m, dtype=np.float64)
+    exponent = (h * c) / (wavelength_m * k_B * T)
+    # 오버플로 방지
+    exponent = np.clip(exponent, -700, 700)
+    intensity = (2 * h * c ** 2) / (wavelength_m ** 5) / (np.exp(exponent) - 1)
+    return intensity
 
-@st.cache_data(show_spinner=False)
-def load_fits(file_bytes: bytes):
-    """업로드된 바이트에서 FITS를 읽어 (data, header, hdu 인덱스) 반환"""
-    hdul = fits.open(io.BytesIO(file_bytes))
-    # 이미지 데이터가 들어있는 첫 HDU 탐색 (data가 None이 아닌 것)
-    idx = 0
-    for i, hdu in enumerate(hdul):
-        if hdu.data is not None:
-            idx = i
+
+def wien_peak_temperature(wavelength_m, flux):
+    """
+    빈의 변위법칙(Wien's displacement law)을 이용한 초기 온도 추정값.
+    b = 2.8977719e-3 m·K
+    """
+    b = 2.8977719e-3
+    peak_idx = np.argmax(flux)
+    lambda_peak = wavelength_m[peak_idx]
+    if lambda_peak <= 0:
+        return 5778.0  # 태양 온도를 기본값으로 사용
+    return b / lambda_peak
+
+
+# ------------------------------------------------------------------
+# 2. FITS 파일에서 스펙트럼(파장, flux) 데이터 추출
+# ------------------------------------------------------------------
+def extract_spectrum(hdul):
+    """
+    FITS HDU 리스트에서 1차원 스펙트럼 데이터를 찾아 (wavelength[m], flux) 반환.
+    - 1차원 데이터 + WCS(CRVAL1/CDELT1/CRPIX1)로 파장축을 만드는 경우를 우선 처리.
+    - 파장 단위 헤더(CUNIT1)가 있으면 nm/Angstrom -> m 변환.
+    """
+    data = None
+    header = None
+    for hdu in hdul:
+        if hdu.data is not None and hdu.data.ndim == 1:
+            data = hdu.data.astype(np.float64)
+            header = hdu.header
             break
-    data = hdul[idx].data
-    header = hdul[idx].header
-    hdul.close()
-    return data, header, idx
 
+    if data is None:
+        return None, None, None  # 1차원 스펙트럼 데이터가 없는 경우
 
-def get_wcs(header):
+    n = data.size
+
+    # WCS 정보로 파장축 생성 시도
     try:
-        w = WCS(header)
-        if w.has_celestial:
-            return w
-        return None
-    except Exception as e:
-        st.error(f"WCS 파싱 실패: {e}")
-        return None
+        w = WCS(header, naxis=1)
+        pix = np.arange(n)
+        wavelength = w.wcs_pix2world(pix, 0)[0]
+    except Exception:
+        crval1 = header.get("CRVAL1", 1)
+        cdelt1 = header.get("CDELT1", header.get("CD1_1", 1))
+        crpix1 = header.get("CRPIX1", 1)
+        pix = np.arange(n)
+        wavelength = crval1 + (pix + 1 - crpix1) * cdelt1
+
+    # 단위를 미터로 변환 (기본값: Angstrom으로 가정)
+    unit = str(header.get("CUNIT1", "Angstrom")).lower()
+    if "nm" in unit:
+        wavelength_m = wavelength * 1e-9
+    elif "angstrom" in unit or unit == "a":
+        wavelength_m = wavelength * 1e-10
+    elif "um" in unit or "micron" in unit:
+        wavelength_m = wavelength * 1e-6
+    else:
+        # 단위 정보가 없으면 Angstrom으로 가정
+        wavelength_m = wavelength * 1e-10
+
+    flux = data
+    return wavelength_m, flux, header
 
 
-def make_display_image(data: np.ndarray):
-    """2D 이미지 데이터를 ZScale로 정규화하여 matplotlib figure 생성"""
-    # 다차원(예: 3D 큐브)일 경우 첫 프레임만 사용
-    arr = np.array(data, dtype=float)
-    while arr.ndim > 2:
-        arr = arr[0]
+# ------------------------------------------------------------------
+# 3. 흑체 온도 피팅
+# ------------------------------------------------------------------
+def fit_temperature(wavelength_m, flux):
+    """
+    scipy.optimize.curve_fit으로 Planck 함수를 스펙트럼에 피팅하여
+    온도(T)와 오차를 반환.
+    """
+    # 음수/0 제거 및 정규화
+    mask = (wavelength_m > 0) & np.isfinite(flux)
+    wavelength_m = wavelength_m[mask]
+    flux = flux[mask]
 
-    norm = ImageNormalize(arr, interval=ZScaleInterval())
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.imshow(arr, origin="lower", cmap="gray", norm=norm)
-    ax.set_xlabel("X (pixel)")
-    ax.set_ylabel("Y (pixel)")
-    fig.tight_layout()
-    return fig, arr
+    flux_norm = flux / np.max(flux)
+
+    T0 = wien_peak_temperature(wavelength_m, flux)
+
+    def model(wl, T, scale):
+        planck = planck_lambda(wl, T)
+        return scale * planck / np.max(planck)
+
+    popt, pcov = curve_fit(
+        model, wavelength_m, flux_norm,
+        p0=[T0, 1.0],
+        bounds=([500, 0], [50000, 10]),
+        maxfev=10000,
+    )
+    T_fit, scale_fit = popt
+    T_err = np.sqrt(pcov[0, 0])
+    return T_fit, T_err, model, wavelength_m, flux_norm
 
 
-def pixel_to_radec(w: WCS, x: float, y: float):
-    sky = w.pixel_to_world(x, y)
-    if isinstance(sky, SkyCoord):
-        return sky
-    # 일부 WCS(3D 등)는 리스트를 반환할 수 있음
-    return sky[0]
+# ------------------------------------------------------------------
+# 4. WCS를 이용한 천체 위치(RA/Dec) 계산
+# ------------------------------------------------------------------
+def get_sky_position(hdul):
+    """
+    2차원 이미지 HDU에서 WCS 정보를 읽어 천체(가장 밝은 픽셀 또는 이미지 중심)의
+    적경(RA), 적위(Dec)를 계산.
+    """
+    for hdu in hdul:
+        if hdu.data is not None and hdu.data.ndim == 2:
+            data = hdu.data
+            header = hdu.header
+            try:
+                w = WCS(header)
+            except Exception:
+                return None, None, None
+
+            # 가장 밝은 픽셀(천체로 추정)을 대상 좌표로 사용
+            y_max, x_max = np.unravel_index(np.nanargmax(data), data.shape)
+            ra, dec = w.wcs_pix2world(x_max, y_max, 0)
+
+            sky_coord = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+            return sky_coord, (x_max, y_max), data
+    return None, None, None
 
 
-def radec_to_pixel(w: WCS, ra_deg: float, dec_deg: float):
-    sky = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-    x, y = w.world_to_pixel(sky)
-    return float(x), float(y)
+# ------------------------------------------------------------------
+# 5. Streamlit UI
+# ------------------------------------------------------------------
+def main():
+    st.set_page_config(page_title="천체 위치·온도 분석", layout="wide")
+    st.title("🔭 천체 FITS 분석: 위치(WCS) & 온도(스펙트럼) 계산")
 
+    st.markdown(
+        """
+        FITS 파일을 업로드하면:
+        1. **2차원 이미지 데이터**가 있으면 WCS 정보로 천체의 하늘 좌표(RA/Dec)를 계산합니다.
+        2. **1차원 스펙트럼 데이터**가 있으면 흑체복사(Planck) 피팅으로 표면 온도를 추정합니다.
+        """
+    )
 
-# ---------------------------------------------------------------------------
-# 메인 UI
-# ---------------------------------------------------------------------------
+    uploaded_file = st.file_uploader("FITS 파일 업로드 (.fits, .fit)", type=["fits", "fit"])
 
-uploaded_file = st.file_uploader(
-    "FITS 파일 업로드 (.fits, .fit, .fts)",
-    type=["fits", "fit", "fts"],
-)
+    if uploaded_file is None:
+        st.info("분석할 FITS 파일을 업로드해주세요.")
+        return
 
-if uploaded_file is None:
-    st.info("좌측 상단에서 FITS 파일을 업로드해 주세요.")
-    st.stop()
-
-file_bytes = uploaded_file.read()
-
-with st.spinner("FITS 파일을 읽는 중..."):
     try:
-        data, header, hdu_idx = load_fits(file_bytes)
+        file_bytes = uploaded_file.read()
+        hdul = fits.open(io.BytesIO(file_bytes))
     except Exception as e:
-        st.error(f"FITS 파일을 읽을 수 없습니다: {e}")
-        st.stop()
+        st.error(f"FITS 파일을 여는 데 실패했습니다: {e}")
+        return
 
-if data is None:
-    st.error("이미지 데이터를 찾을 수 없습니다. (선택된 HDU에 데이터 없음)")
-    st.stop()
+    col1, col2 = st.columns(2)
 
-w = get_wcs(header)
+    # ---------------- 위치(WCS) ----------------
+    with col1:
+        st.subheader("📍 천체 위치 (WCS)")
+        sky_coord, pixel_pos, image_data = get_sky_position(hdul)
+        if sky_coord is not None:
+            st.write(f"**RA (적경):** {sky_coord.ra.to_string(unit=u.hourangle, sep=':')} "
+                     f"({sky_coord.ra.deg:.6f}°)")
+            st.write(f"**Dec (적위):** {sky_coord.dec.to_string(unit=u.deg, sep=':')} "
+                     f"({sky_coord.dec.deg:.6f}°)")
 
-col_img, col_info = st.columns([2, 1])
+            fig, ax = plt.subplots()
+            vmin, vmax = np.nanpercentile(image_data, [5, 99])
+            ax.imshow(image_data, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+            ax.scatter(pixel_pos[0], pixel_pos[1], s=120, facecolors="none",
+                       edgecolors="red", linewidths=2)
+            ax.set_title("탐지된 천체 위치 (빨간 원)")
+            st.pyplot(fig)
+        else:
+            st.warning("이미지(2D) 데이터 또는 WCS 정보를 찾지 못했습니다.")
 
-with col_info:
-    st.subheader("📋 헤더 / WCS 정보")
-    st.write(f"**사용된 HDU 인덱스:** {hdu_idx}")
-    st.write(f"**이미지 크기 (shape):** {data.shape}")
-
-    if w is None:
-        st.warning("이 FITS 헤더에는 유효한 천체 좌표계(WCS) 정보가 없습니다. "
-                   "CRVAL/CRPIX/CDELT/CTYPE 등의 키워드를 확인해 주세요.")
-    else:
-        st.success("WCS 정보를 정상적으로 읽었습니다.")
-        wcs_keys = ["CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2",
-                    "CRPIX1", "CRPIX2", "CDELT1", "CDELT2", "CD1_1", "CD2_2"]
-        found = {k: header[k] for k in wcs_keys if k in header}
-        if found:
-            st.json(found)
-
-    with st.expander("전체 FITS 헤더 보기"):
-        st.text(repr(header))
-
-with col_img:
-    st.subheader("🖼️ 이미지")
-    fig, arr = make_display_image(data)
-
-    if w is not None and HAS_CLICK:
-        st.caption("이미지를 클릭하면 해당 픽셀의 RA/Dec를 계산합니다.")
-        # matplotlib figure -> PNG로 변환 후 클릭 좌표 컴포넌트에 표시
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150)
-        buf.seek(0)
-        from PIL import Image
-        pil_img = Image.open(buf)
-
-        coords = streamlit_image_coordinates(pil_img, key="fits_click")
-        plt.close(fig)
-
-        if coords is not None:
-            # 화면상 픽셀 좌표를 원본 이미지 픽셀 좌표로 환산
-            disp_w, disp_h = pil_img.size
-            data_h, data_w = arr.shape
-            click_x_disp, click_y_disp = coords["x"], coords["y"]
-
-            # matplotlib figure의 여백을 고려하기보다는 근사 비율 변환 사용
-            px = click_x_disp / disp_w * data_w
-            # imshow origin='lower' 이므로 화면 y(위->아래)를 데이터 y(아래->위)로 반전
-            py = data_h - (click_y_disp / disp_h * data_h)
-
-            st.session_state["pick_x"] = px
-            st.session_state["pick_y"] = py
-    else:
-        st.pyplot(fig)
-        plt.close(fig)
-        if w is not None and not HAS_CLICK:
-            st.caption(
-                "💡 이미지를 클릭해서 좌표를 얻으려면 "
-                "`pip install streamlit-image-coordinates` 를 설치하세요. "
-                "지금은 아래에서 픽셀 좌표를 직접 입력해 주세요."
-            )
-
-# ---------------------------------------------------------------------------
-# 좌표 변환 UI
-# ---------------------------------------------------------------------------
-
-if w is not None:
-    st.divider()
-    st.subheader("📐 좌표 변환")
-
-    tab_pix2sky, tab_sky2pix = st.tabs(["픽셀 → 하늘좌표 (RA/Dec)", "하늘좌표 → 픽셀"])
-
-    ny, nx = arr.shape
-
-    with tab_pix2sky:
-        c1, c2, c3 = st.columns([1, 1, 1])
-        default_x = st.session_state.get("pick_x", nx / 2)
-        default_y = st.session_state.get("pick_y", ny / 2)
-
-        x_pix = c1.number_input("X (pixel)", value=float(default_x), format="%.3f")
-        y_pix = c2.number_input("Y (pixel)", value=float(default_y), format="%.3f")
-
-        if c3.button("계산하기", type="primary", key="btn_pix2sky"):
+    # ---------------- 온도(스펙트럼) ----------------
+    with col2:
+        st.subheader("🌡️ 온도 (흑체복사 스펙트럼 피팅)")
+        wavelength_m, flux, spec_header = extract_spectrum(hdul)
+        if wavelength_m is not None:
             try:
-                sky = pixel_to_radec(w, x_pix, y_pix)
-                ra_deg = sky.ra.deg
-                dec_deg = sky.dec.deg
+                T_fit, T_err, model, wl_used, flux_norm = fit_temperature(wavelength_m, flux)
 
-                r1, r2 = st.columns(2)
-                with r1:
-                    st.metric("RA (deg)", f"{ra_deg:.6f}")
-                    st.metric("RA (hms)", sky.ra.to_string(unit=u.hourangle, sep=":", precision=2))
-                with r2:
-                    st.metric("Dec (deg)", f"{dec_deg:.6f}")
-                    st.metric("Dec (dms)", sky.dec.to_string(unit=u.deg, sep=":", precision=2))
+                st.metric("추정 온도", f"{T_fit:,.0f} K", delta=f"± {T_err:,.0f} K")
 
-                st.code(
-                    f"RA  = {ra_deg:.6f} deg  ({sky.ra.to_string(unit=u.hourangle, sep=':', precision=2)})\n"
-                    f"Dec = {dec_deg:.6f} deg ({sky.dec.to_string(unit=u.deg, sep=':', precision=2)})",
-                    language="text",
-                )
+                fig2, ax2 = plt.subplots()
+                wl_nm = wl_used * 1e9  # nm 단위로 표시
+                ax2.plot(wl_nm, flux_norm, "o", ms=3, alpha=0.6, label="관측 스펙트럼")
+
+                wl_smooth = np.linspace(wl_used.min(), wl_used.max(), 500)
+                ax2.plot(wl_smooth * 1e9, model(wl_smooth, T_fit, 1.0), "-", lw=2,
+                         label=f"흑체 피팅 (T={T_fit:,.0f} K)")
+
+                ax2.set_xlabel("파장 (nm)")
+                ax2.set_ylabel("정규화된 flux")
+                ax2.legend()
+                ax2.set_title("스펙트럼 & 흑체복사 피팅")
+                st.pyplot(fig2)
             except Exception as e:
-                st.error(f"좌표 변환 중 오류가 발생했습니다: {e}")
+                st.error(f"온도 피팅에 실패했습니다: {e}")
+        else:
+            st.warning("1차원 스펙트럼(flux-wavelength) 데이터를 찾지 못했습니다.")
 
-    with tab_sky2pix:
-        c1, c2, c3 = st.columns([1, 1, 1])
-        ra_in = c1.number_input("RA (deg)", value=0.0, format="%.6f")
-        dec_in = c2.number_input("Dec (deg)", value=0.0, format="%.6f")
+    with st.expander("FITS 헤더 보기"):
+        st.text(repr(hdul[0].header))
 
-        if c3.button("계산하기", type="primary", key="btn_sky2pix"):
-            try:
-                x_out, y_out = radec_to_pixel(w, ra_in, dec_in)
-                r1, r2 = st.columns(2)
-                r1.metric("X (pixel)", f"{x_out:.3f}")
-                r2.metric("Y (pixel)", f"{y_out:.3f}")
 
-                in_bounds = (0 <= x_out < nx) and (0 <= y_out < ny)
-                if not in_bounds:
-                    st.warning("계산된 픽셀 좌표가 이미지 범위를 벗어났습니다 (이미지 밖의 천체일 수 있습니다).")
-            except Exception as e:
-                st.error(f"좌표 변환 중 오류가 발생했습니다: {e}")
-
-st.divider()
-st.caption(
-    "Made with Astropy WCS + Streamlit. "
-    "이미지 좌상단/좌하단 원점 규약은 FITS 표준(origin=0, 좌하단)을 따릅니다."
-)
+if __name__ == "__main__":
+    main()
